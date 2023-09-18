@@ -1,0 +1,194 @@
+---
+title: "Salary_predictions_ml"
+author: "Sofia Gambirasio"
+date: "2023-09-18"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r, warning=FALSE, message=FALSE}
+library(tidyverse)
+library(tidymodels)
+```
+Import the dataset elaborated in python
+```{r}
+sal = read_csv('C:\\Users\\sofia\\OneDrive\\Desktop\\Lavoro\\Portfolio\\machine learning py\\salary_mod.csv')
+glimpse(sal)
+sal = sal %>% 
+  rename(index = '...1')
+sal_ml = sal %>% 
+  select(!Gender & !index & !Edu_level)
+
+# insert _ in place of spaces 
+names(sal_ml) <- gsub(" ", "_", names(sal_ml)) 
+```
+
+# Data Splitting
+
+```{r}
+set.seed(12, sample.kind = 'Rejection')
+group = sample(c(1, 2, 3),
+               size = nrow(sal_ml),
+               prob = c(0.7, 0.20, 0.10),
+               replace = T)
+
+train_sal = sal_ml[group == 1, ]
+test_sal = sal_ml[group == 2, ]
+val_sal = sal_ml[group == 3, ]
+```
+
+## linear regression 
+We first perform a multiple linear regression in order to see which variables are relevant in explaining `Salary`
+```{r}
+lmreg = lm(Salary ~ ., data = sal_ml)
+summary(lmreg) #adjR = 0.7708
+anova(lmreg)
+
+# remove all race related variables
+sal_1 = sal_ml %>% select(!R_Welsh & !R_Mixed & !R_Korean & !R_Hispanic & !R_Chinese &
+                          !R_Black & !R_Australian & !R_Asian & !R_African American)
+lmreg_1 = lm(Salary ~ ., data = sal_ml)
+summary(lmreg_1) #adjR = 0.7708
+```
+
+## KNN
+```{r}
+library(kknn)
+
+# tuning the k 
+k = 1:10
+mse_vec = c()
+for (i in k){
+  knn_spec = nearest_neighbor(neighbors = i, weight_func = 'rectangular') %>% 
+    set_engine('kknn') %>% 
+    set_mode('regression')
+  knn_fit = knn_spec %>% fit(Salary ~ ., data = train_sal)
+  knn_pred = knn_fit %>% predict(new_data = val_sal)
+  mse_vec[i] = mean((val_sal$Salary-knn_pred$.pred)^2)
+}
+
+data.frame(k, mse_vec) %>% 
+  ggplot(aes(x = k, y = mse_vec))+
+  geom_line()+
+  geom_point()
+
+k_min = which.min(mse_vec)
+  
+# implement the model with the tuned value for k. k = 2 
+knn_spec = nearest_neighbor(neighbors = k_min, weight_func = 'rectangular') %>% 
+    set_engine('kknn') %>% 
+    set_mode('regression')
+knn_fit = knn_spec %>% fit(Salary ~ ., data = train_sal)
+knn_pred = knn_fit %>% predict(new_data = test_sal)
+mse_knn = mean((test_sal$Salary-knn_pred$.pred)^2)
+```
+
+## Regression tree
+```{r, warning=FALSE, message=FALSE}
+library(rpart.plot)
+library(randomForest)
+library(parsnip)
+```
+We generate the tree, prune it using the 1-SE approach but the unpruned tree produces a lower MSE, so we consider it 
+```{r}
+set.seed(1,sample.kind = 'Rejection')
+tree_spec = decision_tree() %>% 
+  set_engine('rpart')  %>% 
+  set_mode('regression')
+tree_fit = tree_spec %>% fit(Salary~., data = train_sal)
+tree_pred = tree_fit %>% predict(new_data = test_sal)
+
+mse_tree = mean((test_sal$Salary-tree_pred$.pred)^2)
+
+# pruning the tree
+
+cptable = data.frame(tree_fit$fit$cptable)
+mincpindex = which.min(cptable[,"xerror"])
+LL = cptable[mincpindex,"xerror"] - cptable[mincpindex,"xstd"]
+UL = cptable[mincpindex,"xerror"] + cptable[mincpindex,"xstd"]
+pos = which(cptable[,"xerror"] > LL & cptable[,"xerror"] < UL) %>% min()
+best_cp = cptable$CP[9]
+
+set.seed(1,sample.kind = 'Rejection')
+tree_spec_pr = decision_tree(cost_complexity = best_cp) %>% 
+  set_engine('rpart')  %>% 
+  set_mode('regression')
+tree_fit_pr = tree_spec_pr %>% fit(Salary~., data = train_sal)
+
+rpart.plot(tree_fit$fit, roundint = F)
+rpart.plot(tree_fit_pr$fit, roundint = F)
+
+tree_pred_pr = tree_fit_pr %>% predict(new_data = test_sal)
+mse_tree_pr = mean((test_sal$Salary-tree_pred_pr$.pred)^2)
+mse_tree_pr
+mse_tree
+```
+## Bagging
+```{r}
+# tuning the number of trees
+
+set.seed(1, sample.kind="Rejection")
+
+ntree_vec = seq(10,1000,by=20)
+obb_mse = c()
+
+for (i in 1:length(ntree_vec)){
+  bag_spec = rand_forest(mtry = ncol(train_sal)-1, 
+                       trees = ntree_vec[i],
+                       ) %>% 
+  set_engine('randomForest',importance = T) %>% 
+  set_mode('regression')
+  bag_fit = bag_spec %>% fit(Salary ~ ., data = train_sal)
+  obb_mse[i] = bag_fit$fit$mse[ntree_vec[i]]
+}
+
+data.frame(ntree_vec,obb_mse) %>%
+  ggplot(aes(ntree_vec,obb_mse)) +
+  geom_line()+
+  geom_point()+
+  xlab("Number of trees")+
+  ylab("OOB MSE")
+
+n_trees = ntree_vec[which.min(obb_mse)]
+
+
+# computing the model with the tuned number of trees 
+bag_spec = rand_forest(mtry = ncol(train_sal)-1, 
+                       trees = 500,
+                       ) %>% 
+  set_engine('randomForest',importance = T) %>% 
+  set_mode('regression')
+bag_fit = bag_spec %>% fit(Salary ~ ., data = train_sal)
+
+# variance importance 
+bag_fit$fit$importance
+
+# predictions
+bag_pred = predict(bag_fit, new_data = test_sal)
+bag_mse = mean((test_sal$Salary - bag_pred$.pred)^2)
+bag_mse
+
+
+```
+
+```{r}
+```
+```{r}
+```
+```{r}
+```
+```{r}
+```
+```{r}
+```
+```{r}
+```
+```{r}
+```
+```{r}
+```
+
+
